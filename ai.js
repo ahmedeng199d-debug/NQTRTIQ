@@ -1,134 +1,120 @@
-import { generateObject } from "ai";
-import { z } from "zod";
+// api/ai.js  ← place at ROOT of your project (not inside /src or /app)
+// Vercel Pages Router serverless function — CommonJS, no bundler needed
+// Add GEMINI_API_KEY in Vercel Dashboard → Settings → Environment Variables
 
-import { geminiFlashModel } from ".";
+module.exports = async function handler(req, res) {
+  res.setHeader('Access-Control-Allow-Origin',  '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.status(200).end();
+  if (req.method !== 'POST')   return res.status(405).json({ error: 'Method not allowed' });
 
-export async function generateSampleFlightStatus({
-  flightNumber,
-  date,
-}: {
-  flightNumber: string;
-  date: string;
-}) {
-  const { object: flightStatus } = await generateObject({
-    model: geminiFlashModel,
-    prompt: `Flight status for flight number ${flightNumber} on ${date}`,
-    schema: z.object({
-      flightNumber: z.string().describe("Flight number, e.g., BA123, AA31"),
-      departure: z.object({
-        cityName: z.string().describe("Name of the departure city"),
-        airportCode: z.string().describe("IATA code of the departure airport"),
-        airportName: z.string().describe("Full name of the departure airport"),
-        timestamp: z.string().describe("ISO 8601 departure date and time"),
-        terminal: z.string().describe("Departure terminal"),
-        gate: z.string().describe("Departure gate"),
-      }),
-      arrival: z.object({
-        cityName: z.string().describe("Name of the arrival city"),
-        airportCode: z.string().describe("IATA code of the arrival airport"),
-        airportName: z.string().describe("Full name of the arrival airport"),
-        timestamp: z.string().describe("ISO 8601 arrival date and time"),
-        terminal: z.string().describe("Arrival terminal"),
-        gate: z.string().describe("Arrival gate"),
-      }),
-      totalDistanceInMiles: z
-        .number()
-        .describe("Total flight distance in miles"),
-    }),
+  const KEY = process.env.GEMINI_API_KEY;
+  if (!KEY) return res.status(500).json({
+    error: 'GEMINI_API_KEY missing. Add it in Vercel → Settings → Environment Variables.'
   });
 
-  return flightStatus;
-}
+  const { message = '', context = '', history = [] } = req.body || {};
 
-export async function generateSampleFlightSearchResults({
-  origin,
-  destination,
-}: {
-  origin: string;
-  destination: string;
-}) {
-  const { object: flightSearchResults } = await generateObject({
-    model: geminiFlashModel,
-    prompt: `Generate search results for flights from ${origin} to ${destination}, limit to 4 results`,
-    output: "array",
-    schema: z.object({
-      id: z
-        .string()
-        .describe("Unique identifier for the flight, like BA123, AA31, etc."),
-      departure: z.object({
-        cityName: z.string().describe("Name of the departure city"),
-        airportCode: z.string().describe("IATA code of the departure airport"),
-        timestamp: z.string().describe("ISO 8601 departure date and time"),
-      }),
-      arrival: z.object({
-        cityName: z.string().describe("Name of the arrival city"),
-        airportCode: z.string().describe("IATA code of the arrival airport"),
-        timestamp: z.string().describe("ISO 8601 arrival date and time"),
-      }),
-      airlines: z.array(
-        z.string().describe("Airline names, e.g., American Airlines, Emirates"),
-      ),
-      priceInUSD: z.number().describe("Flight price in US dollars"),
-      numberOfStops: z.number().describe("Number of stops during the flight"),
-    }),
-  });
+  // Safely coerce context to string regardless of what the client sends
+  const contextStr =
+    typeof context === 'string'
+      ? context || 'No trade data yet.'
+      : (JSON.stringify(context) ?? 'No trade data yet.');
 
-  return { flights: flightSearchResults };
-}
+  const messageStr = String(message).trim();
+  if (!messageStr) return res.status(400).json({ error: 'message is required' });
 
-export async function generateSampleSeatSelection({
-  flightNumber,
-}: {
-  flightNumber: string;
-}) {
-  const { object: rows } = await generateObject({
-    model: geminiFlashModel,
-    prompt: `Simulate available seats for flight number ${flightNumber}, 6 seats on each row and 5 rows in total, adjust pricing based on location of seat`,
-    output: "array",
-    schema: z.array(
-      z.object({
-        seatNumber: z.string().describe("Seat identifier, e.g., 12A, 15C"),
-        priceInUSD: z
-          .number()
-          .describe("Seat price in US dollars, less than $99"),
-        isAvailable: z
-          .boolean()
-          .describe("Whether the seat is available for booking"),
-      }),
-    ),
-  });
+  const system = `You are NT AI, an elite trading coach inside the NQTRT journal.
+You have the trader's real data below. Reference their actual numbers. Max 180 words.
+TRADER DATA:
+${contextStr}`;
 
-  return { seats: rows };
-}
+  // Build Gemini contents array from history
+  const contents = [];
 
-export async function generateReservationPrice(props: {
-  seats: string[];
-  flightNumber: string;
-  departure: {
-    cityName: string;
-    airportCode: string;
-    timestamp: string;
-    gate: string;
-    terminal: string;
-  };
-  arrival: {
-    cityName: string;
-    airportCode: string;
-    timestamp: string;
-    gate: string;
-    terminal: string;
-  };
-  passengerName: string;
-}) {
-  const { object: reservation } = await generateObject({
-    model: geminiFlashModel,
-    prompt: `Generate price for the following reservation \n\n ${JSON.stringify(props, null, 2)}`,
-    schema: z.object({
-      totalPriceInUSD: z
-        .number()
-        .describe("Total reservation price in US dollars"),
-    }),
-  });
+  for (const m of (Array.isArray(history) ? history.slice(-10) : [])) {
+    if (!m?.role || !m?.content) continue;
 
-  return reservation;
-}
+    // Normalize 'assistant' → 'model' for Gemini; everything else → 'user'
+    const role = (m.role === 'assistant' || m.role === 'model') ? 'model' : 'user';
+
+    // Handle content that may be an OpenAI-style array or a plain string
+    const text = Array.isArray(m.content)
+      ? m.content.map(c => (typeof c === 'string' ? c : c?.text ?? '')).join('\n')
+      : String(m.content);
+
+    if (!text.trim()) continue; // skip empty turns
+    contents.push({ role, parts: [{ text }] });
+  }
+
+  // Always append the new user message as a fresh part.
+  // Gemini rejects two consecutive 'user' turns — merge into parts[] instead.
+  if (contents.length && contents[contents.length - 1].role === 'user') {
+    contents[contents.length - 1].parts.push({ text: messageStr });
+  } else {
+    contents.push({ role: 'user', parts: [{ text: messageStr }] });
+  }
+
+  // Abort fetch after 25 s — Vercel functions time out at 30 s by default
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 25000);
+
+  try {
+    const r = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${KEY}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({
+          system_instruction: { parts: [{ text: system }] },
+          contents,
+          generationConfig: {
+            maxOutputTokens: 600,
+            temperature: 0.7,
+            topP: 0.9
+          }
+        })
+      }
+    );
+
+    clearTimeout(timeout);
+    const data = await r.json();
+
+    if (!r.ok) {
+      // Cap forwarded status to a safe range (100–599); Gemini can return
+      // non-standard codes that would crash Vercel's res.status()
+      const safeStatus = (r.status >= 100 && r.status <= 599) ? r.status : 502;
+      return res.status(safeStatus).json({
+        error: data?.error?.message || `Gemini API error (HTTP ${r.status})`
+      });
+    }
+
+    const candidate = data?.candidates?.[0];
+
+    // candidate.content can be undefined when Gemini safety-filters the response
+    if (!candidate || !candidate.content) {
+      const reason = candidate?.finishReason || 'UNKNOWN';
+      return res.status(502).json({
+        error: `Gemini returned no content. Finish reason: ${reason}`
+      });
+    }
+
+    // Use ?. on .parts — candidate.content is confirmed above but parts could
+    // theoretically be missing on a malformed response
+    const reply = candidate.content.parts
+      ?.map(p => p.text ?? '')
+      .join('')
+      .trim() || 'No response.';
+
+    return res.status(200).json({ reply });
+
+  } catch (e) {
+    clearTimeout(timeout);
+    if (e.name === 'AbortError') {
+      return res.status(504).json({ error: 'Gemini request timed out after 25 s.' });
+    }
+    return res.status(500).json({ error: e.message || 'Internal server error' });
+  }
+};
